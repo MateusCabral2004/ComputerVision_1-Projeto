@@ -402,11 +402,16 @@ REFERENCE_BGR_COLORS = {
     "green": np.uint8([[[70, 150, 40]]]),
     "maroon": np.uint8([[[45, 60, 120]]]),
 }
-REFERENCE_LAB_COLORS = {
-    name: cv2.cvtColor(color, cv2.COLOR_BGR2LAB)[0, 0].astype(np.float32)
-    for name, color in REFERENCE_BGR_COLORS.items()
-}
 
+REFERENCE_LAB_COLORS = {
+    "yellow":  np.array([159, 131, 158], dtype=np.float32),
+    "blue":    np.array([80,  130,  98], dtype=np.float32),
+    "red":     np.array([116, 158, 146], dtype=np.float32),
+    "purple":  np.array([126, 122, 122], dtype=np.float32),
+    "orange":  np.array([135, 149, 149], dtype=np.float32),
+    "green":   np.array([126, 113, 136], dtype=np.float32),
+    "maroon":  np.array([124, 133, 145], dtype=np.float32),
+}
 
 def get_playing_surface_masks(top_view_img):
     """
@@ -1413,574 +1418,233 @@ def save_results_json(results, json_path):
 # ----------------------------
 # Pipeline
 # ----------------------------
-def run_pipeline(image_path, display=True):
-    img = load_image(image_path)
-
-    labels, shape, K = kmeans_cluster_refined(img, 5)
-    masks = get_cluster_masks(labels, shape, K)
-
-    blue_idx = find_blue_cluster(img, labels, K)
-    blue_mask = masks[blue_idx] if blue_idx != -1 else None
-    cloth_model = build_original_cloth_model(img, blue_mask)
-    detections = detect_and_classify_balls_original(img, cloth_model, keep_internal=False)
-
-    target = select_target_cluster(img, labels, masks, blue_idx)
-    warped, warp_meta = warp_from_cluster(img, masks[target], return_meta=True) if target != -1 else (None, None)
-
-    if display:
-        show("Original", img)
-
-    if warped is None:
-        fallback = extract_blue_cloth(img, padding=50)
-        annotated_original = draw_ball_detections(img, detections)
-        if display and fallback is not None:
-            show("Fallback Blue Cloth", fallback)
-            show("Ball Detection on Original", annotated_original)
-        return {
-            "image": os.path.basename(image_path),
-            "total_balls": len(detections),
-            "balls": detections,
-            "top_view": fallback,
-            "annotated_top_view": fallback.copy() if fallback is not None else None,
-            "annotated_image": annotated_original,
-        }
-
-    top_view, crop_bbox = extract_blue_cloth(warped, padding=20, return_bbox=True)
-    annotated_original = draw_ball_detections(img, detections)
-
-    if display:
-        show("Warped", warped)
-        show("Top View", top_view)
-        show("Ball Detection on Original", annotated_original)
-        print(f"Total balls detected: {len(detections)}")
-        for det in detections:
-            print(f"Ball {det['number']:>2} | bbox={det['bbox']} | type={det['type']} | color={det['color']}")
-
-    return {
-        "image": os.path.basename(image_path),
-        "total_balls": len(detections),
-        "balls": detections,
-        "top_view": top_view,
-        "annotated_top_view": top_view.copy() if top_view is not None else None,
-        "annotated_image": annotated_original,
-    }
-
-def process_directory(input_dir, save_top_view_dir=None, save_annotated_dir=None, json_path=None, display=False):
-    results = []
-
-    if save_top_view_dir is not None:
-        os.makedirs(save_top_view_dir, exist_ok=True)
-    if save_annotated_dir is not None:
-        os.makedirs(save_annotated_dir, exist_ok=True)
-
-    for image_name in sorted(os.listdir(input_dir)):
-        if not image_name.lower().endswith((".jpg", ".jpeg", ".png")):
-            continue
-
-        image_path = os.path.join(input_dir, image_name)
-        result = run_pipeline(image_path, display=display)
-        results.append({
-            "image": result["image"],
-            "total_balls": result["total_balls"],
-            "balls": result["balls"],
-        })
-
-        if save_top_view_dir is not None and result["top_view"] is not None:
-            cv2.imwrite(os.path.join(save_top_view_dir, image_name), result["top_view"])
-
-        annotated_to_save = result.get("annotated_image", result.get("annotated_top_view"))
-        if save_annotated_dir is not None and annotated_to_save is not None:
-            cv2.imwrite(os.path.join(save_annotated_dir, image_name), annotated_to_save)
-
-    if json_path is not None:
-        save_results_json(results, json_path)
-
-    return results
-
-
-if __name__ == "__main__":
-    development_dir = r"C:\Users\victo\OneDrive - Universidade do Porto\MIA_1Y2S\VC_2\development_set"
-    top_view_dir = os.path.join(development_dir, "top_views")
-    annotated_dir = os.path.join(development_dir, "detections")
-    json_output = os.path.join(development_dir, "results.json")
-
-    if os.path.isdir(development_dir):
-        results = process_directory(
-            development_dir,
-            save_top_view_dir=top_view_dir,
-            save_annotated_dir=annotated_dir,
-            json_path=json_output,
-            display=False,
-        )
-        print(json.dumps(results[:3], indent=2))
-    else:
-        print("Update 'development_dir' to your local dataset path before running the script.")
-
-
-# ============================
-# Improved original-image ball detection
-# ============================
-
-def _keep_largest_component(mask):
-    mask = (mask > 0).astype(np.uint8) * 255
-    num, labels, stats, _ = cv2.connectedComponentsWithStats(mask, 8)
-    if num <= 1:
-        return mask
-    idx = 1 + np.argmax(stats[1:, cv2.CC_STAT_AREA])
-    return ((labels == idx).astype(np.uint8) * 255)
-
-
-def _fill_holes(mask):
-    mask = (mask > 0).astype(np.uint8) * 255
-    h, w = mask.shape[:2]
-    flood = mask.copy()
-    flood_mask = np.zeros((h + 2, w + 2), np.uint8)
-    cv2.floodFill(flood, flood_mask, (0, 0), 255)
-    holes = cv2.bitwise_not(flood)
-    return cv2.bitwise_or(mask, holes)
-
-
-def get_original_cloth_masks(original_img, blue_mask=None):
-    hsv = cv2.cvtColor(original_img, cv2.COLOR_BGR2HSV)
-    H, W = original_img.shape[:2]
-
-    coarse = cv2.inRange(hsv, np.array([80, 18, 35]), np.array([130, 255, 255]))
-    if blue_mask is not None:
-        coarse = cv2.bitwise_or(coarse, blue_mask)
-
-    coarse = _keep_largest_component(coarse)
-    coarse = cv2.morphologyEx(
-        coarse,
-        cv2.MORPH_CLOSE,
-        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (17, 17)),
-        iterations=2,
-    )
-    outer_mask = _fill_holes(coarse)
-
-    coarse_pixels = hsv[outer_mask > 0]
-    if coarse_pixels.size == 0:
-        return None
-
-    cloth_h = float(np.median(coarse_pixels[:, 0]))
-    cloth_s = float(np.median(coarse_pixels[:, 1]))
-    cloth_v = float(np.median(coarse_pixels[:, 2]))
-
-    h_tol = 14
-    s_lo = max(8, int(np.percentile(coarse_pixels[:, 1], 8) - 10))
-    v_lo = max(60, int(np.percentile(coarse_pixels[:, 2], 38)))
-
-    lower = np.array([max(0, int(cloth_h - h_tol)), s_lo, v_lo], dtype=np.uint8)
-    upper = np.array([min(179, int(cloth_h + h_tol)), 255, 255], dtype=np.uint8)
-    inner_mask = cv2.inRange(hsv, lower, upper)
-    inner_mask = cv2.bitwise_and(inner_mask, outer_mask)
-    inner_mask = _keep_largest_component(inner_mask)
-    inner_mask = cv2.morphologyEx(
-        inner_mask,
-        cv2.MORPH_CLOSE,
-        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (21, 21)),
-        iterations=2,
-    )
-    inner_mask = _fill_holes(inner_mask)
-
-    if cv2.countNonZero(inner_mask) < 0.35 * cv2.countNonZero(outer_mask):
-        inner_mask = cv2.erode(
-            outer_mask,
-            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (21, 21)),
-            iterations=1,
-        )
-
-    center_mask = cv2.dilate(
-        inner_mask,
-        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (19, 19)),
-        iterations=1,
-    )
-    center_mask = cv2.bitwise_and(center_mask, outer_mask)
-
-    dist_to_outer = cv2.distanceTransform((outer_mask > 0).astype(np.uint8), cv2.DIST_L2, 5)
-    dist_to_inner = cv2.distanceTransform((inner_mask > 0).astype(np.uint8), cv2.DIST_L2, 5)
-
-    reference_mask = cv2.erode(
-        inner_mask,
-        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15)),
-        iterations=1,
-    )
-    if cv2.countNonZero(reference_mask) < 500:
-        reference_mask = inner_mask.copy()
-
-    lab = cv2.cvtColor(original_img, cv2.COLOR_BGR2LAB).astype(np.float32)
-    cloth_lab = np.median(lab[reference_mask > 0], axis=0).astype(np.float32)
-
-    return {
-        "outer_mask": outer_mask,
-        "inner_mask": inner_mask,
-        "center_mask": center_mask,
-        "dist_to_outer": dist_to_outer,
-        "dist_to_inner": dist_to_inner,
-        "cloth_lab": cloth_lab,
-        "cloth_h": cloth_h,
-        "cloth_s": cloth_s,
-        "cloth_v": cloth_v,
-    }
-
-
-def _estimate_radius_bounds(mask, shape):
-    H, W = shape[:2]
-    ys, xs = np.where(mask > 0)
-    if len(xs) == 0:
-        base = min(H, W)
-    else:
-        base = min(xs.max() - xs.min() + 1, ys.max() - ys.min() + 1)
-    min_r = max(7, int(0.0105 * base))
-    max_r = max(min_r + 4, int(0.028 * base))
-    return min_r, max_r
-
-
-def _local_delta_map(original_img, surface_stats):
-    lab = cv2.cvtColor(original_img, cv2.COLOR_BGR2LAB).astype(np.float32)
-    delta_lab = np.linalg.norm(lab - surface_stats["cloth_lab"], axis=2)
-    delta_u8 = np.clip(delta_lab, 0, 255).astype(np.uint8)
-    delta_u8 = cv2.GaussianBlur(delta_u8, (7, 7), 1.2)
-    delta_u8[surface_stats["outer_mask"] == 0] = 0
-    return delta_lab, delta_u8
-
-
-def _candidate_quality(original_img, surface_stats, x, y, r, delta_lab=None):
-    H, W = original_img.shape[:2]
-    if delta_lab is None:
-        lab = cv2.cvtColor(original_img, cv2.COLOR_BGR2LAB).astype(np.float32)
-        delta_lab = np.linalg.norm(lab - surface_stats["cloth_lab"], axis=2)
-
-    if x < 0 or y < 0 or x >= W or y >= H:
-        return None
-    if surface_stats["outer_mask"][y, x] == 0 or surface_stats["center_mask"][y, x] == 0:
-        return None
-    if surface_stats["dist_to_outer"][y, x] < max(2.0, 0.20 * r):
-        return None
-
-    yy, xx = np.ogrid[:H, :W]
-    disk = (xx - x) ** 2 + (yy - y) ** 2 <= int((0.82 * r) ** 2)
-    if np.count_nonzero(disk) < 25:
-        return None
-
-    local_delta = delta_lab[disk]
-    mean_delta = float(np.mean(local_delta))
-    p85_delta = float(np.percentile(local_delta, 85)) if local_delta.size > 0 else 0.0
-    if mean_delta < 7.5 and p85_delta < 12.0:
-        return None
-
-    return {
-        "center": (int(x), int(y)),
-        "radius": int(r),
-        "score": float(mean_delta + 0.35 * p85_delta),
-    }
-
-
-def _detect_hough_candidates(original_img, surface_stats, delta_lab):
-    H, W = original_img.shape[:2]
-    min_r, max_r = _estimate_radius_bounds(surface_stats["inner_mask"], original_img.shape)
-
-    gray = cv2.cvtColor(original_img, cv2.COLOR_BGR2GRAY)
-    gray = cv2.GaussianBlur(gray, (9, 9), 1.5)
-    delta_u8 = np.clip(delta_lab, 0, 255).astype(np.uint8)
-    delta_u8 = cv2.GaussianBlur(delta_u8, (7, 7), 1.2)
-    delta_u8[surface_stats["outer_mask"] == 0] = 0
-
-    passes = [
-        (gray, 18),
-        (gray, 14),
-        (delta_u8, 13),
-        (delta_u8, 10),
-    ]
-
-    candidates = []
-    for image_variant, param2 in passes:
-        circles = cv2.HoughCircles(
-            image_variant,
-            cv2.HOUGH_GRADIENT,
-            dp=1.12,
-            minDist=max(14, int(1.4 * min_r)),
-            param1=80,
-            param2=param2,
-            minRadius=min_r,
-            maxRadius=max_r,
-        )
-        if circles is None:
-            continue
-
-        for x, y, r in np.round(circles[0]).astype(int):
-            q = _candidate_quality(original_img, surface_stats, x, y, r, delta_lab=delta_lab)
-            if q is not None:
-                candidates.append(q)
-
-    return candidates
-
-
-def _detect_component_candidates(original_img, surface_stats, delta_lab):
-    hsv = cv2.cvtColor(original_img, cv2.COLOR_BGR2HSV)
-    sat = hsv[:, :, 1]
-    val = hsv[:, :, 2]
-    hue = hsv[:, :, 0]
-
-    outer = surface_stats["outer_mask"] > 0
-    center_mask = surface_stats["center_mask"] > 0
-
-    reference = surface_stats["inner_mask"] > 0
-    delta_values = delta_lab[reference]
-    if delta_values.size == 0:
-        delta_values = delta_lab[outer]
-    if delta_values.size == 0:
-        return []
-
-    adaptive_thr = max(10.0, float(np.percentile(delta_values, 88)))
-    hue_delta = np.abs(hue.astype(np.int16) - int(round(surface_stats["cloth_h"])))
-    hue_delta = np.minimum(hue_delta, 180 - hue_delta)
-
-    white_mask = outer & (sat < max(55, int(0.45 * surface_stats["cloth_s"]))) & (val > max(145, int(surface_stats["cloth_v"] + 8))) & (delta_lab > 5.0)
-    black_mask = outer & (val < min(88, max(45, int(surface_stats["cloth_v"] - 22)))) & (delta_lab > 5.0)
-    vivid_mask = outer & (sat > max(45, int(0.45 * surface_stats["cloth_s"]))) & ((delta_lab > max(8.0, adaptive_thr * 0.60)) | (hue_delta > 10))
-    generic_mask = outer & (delta_lab > adaptive_thr)
-
-    candidate_mask = (white_mask | black_mask | vivid_mask | generic_mask).astype(np.uint8) * 255
-    candidate_mask = cv2.morphologyEx(
-        candidate_mask,
-        cv2.MORPH_OPEN,
-        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)),
-    )
-    candidate_mask = cv2.morphologyEx(
-        candidate_mask,
-        cv2.MORPH_CLOSE,
-        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)),
-    )
-
-    min_r, max_r = _estimate_radius_bounds(surface_stats["inner_mask"], original_img.shape)
-    min_area = max(35, int(0.35 * np.pi * (min_r ** 2)))
-    max_area = int(8.0 * np.pi * (max_r ** 2))
-
-    num, labels, stats, centroids = cv2.connectedComponentsWithStats(candidate_mask, 8)
-    candidates = []
-    for i in range(1, num):
-        x, y, w, h, area = stats[i]
-        if area < min_area or area > max_area:
-            continue
-        if w > 5 * max_r or h > 5 * max_r:
-            continue
-        aspect = max(w, h) / max(1.0, min(w, h))
-        if aspect > 4.5:
-            continue
-
-        cx, cy = centroids[i]
-        cx = int(round(cx))
-        cy = int(round(cy))
-        if cx < 0 or cy < 0 or cx >= original_img.shape[1] or cy >= original_img.shape[0]:
-            continue
-        if not center_mask[cy, cx]:
-            continue
-
-        comp_mask = (labels == i).astype(np.uint8)
-        pts = np.column_stack(np.where(comp_mask > 0))
-        if len(pts) < 5:
-            continue
-        ys = pts[:, 0]
-        xs = pts[:, 1]
-        r = 0.5 * max(xs.max() - xs.min() + 1, ys.max() - ys.min() + 1)
-        r = int(np.clip(round(r * 0.70), min_r, max_r))
-
-        q = _candidate_quality(original_img, surface_stats, cx, cy, r, delta_lab=delta_lab)
-        if q is not None:
-            candidates.append(q)
-
-    return candidates
-
-
-def _merge_candidates(candidates):
-    ordered = sorted(candidates, key=lambda d: (d["score"], d["radius"]), reverse=True)
-    final = []
-    for cand in ordered:
-        x, y = cand["center"]
-        r = cand["radius"]
-        duplicate = False
-        for prev in final:
-            px, py = prev["center"]
-            pr = prev["radius"]
-            if (x - px) ** 2 + (y - py) ** 2 < (1.05 * max(r, pr)) ** 2:
-                duplicate = True
-                break
-        if not duplicate:
-            final.append(cand)
-    return final
-
-
-def detect_ball_candidates_original(original_img, cloth_model=None):
-    surface_stats = get_original_cloth_masks(original_img, blue_mask=cloth_model)
-    if surface_stats is None:
-        return [], None
-
-    delta_lab, _ = _local_delta_map(original_img, surface_stats)
-    candidates = []
-    candidates.extend(_detect_hough_candidates(original_img, surface_stats, delta_lab))
-    candidates.extend(_detect_component_candidates(original_img, surface_stats, delta_lab))
-    candidates = _merge_candidates(candidates)
-
-    detections = []
-    H, W = original_img.shape[:2]
-    for cand in candidates:
-        x, y = cand["center"]
-        r = cand["radius"]
-        bbox = {
-            "x": int(max(0, x - r)),
-            "y": int(max(0, y - r)),
-            "width": int(min(W - max(0, x - r), 2 * r)),
-            "height": int(min(H - max(0, y - r), 2 * r)),
-        }
-        contour = np.array([
-            [[x - r, y - r]],
-            [[x + r, y - r]],
-            [[x + r, y + r]],
-            [[x - r, y + r]],
-        ], dtype=np.int32)
-        detections.append({
-            "center": [int(x), int(y)],
-            "radius": int(r),
-            "bbox": bbox,
-            "contour": contour,
-            "score": float(cand["score"]),
-        })
-
-    return detections, surface_stats
-
-
-def _median_lab_of_mask(roi_bgr, mask_bool):
-    if np.count_nonzero(mask_bool) == 0:
-        return None
-    lab = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
-    return np.median(lab[mask_bool], axis=0)
-
-
-def _nearest_ball_color_from_lab(lab_value):
-    if lab_value is None:
-        return None
-    best_color = None
-    best_dist = 1e9
-    for name, ref in REFERENCE_LAB_COLORS.items():
-        d = float(np.linalg.norm(lab_value - ref))
-        if d < best_dist:
-            best_dist = d
-            best_color = name
-    return best_color
-
-
-def classify_ball_candidate_original(original_img, det, surface_stats):
-    if surface_stats is None:
-        return None
-
-    H, W = original_img.shape[:2]
-    cx, cy = det["center"]
-    r = int(max(6, det["radius"]))
-
-    x1 = max(0, cx - int(1.25 * r))
-    y1 = max(0, cy - int(1.25 * r))
-    x2 = min(W, cx + int(1.25 * r) + 1)
-    y2 = min(H, cy + int(1.25 * r) + 1)
-    roi = original_img[y1:y2, x1:x2]
-    if roi.size == 0:
-        return None
-
-    yy, xx = np.ogrid[y1:y2, x1:x2]
-    dist2 = (xx - cx) ** 2 + (yy - cy) ** 2
-    disk = dist2 <= int((0.90 * r) ** 2)
-    core = dist2 <= int((0.78 * r) ** 2)
-
-    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
-    lab = cv2.cvtColor(roi, cv2.COLOR_BGR2LAB).astype(np.float32)
-    delta_lab = np.linalg.norm(lab - surface_stats["cloth_lab"], axis=2)
-
-    sat = hsv[:, :, 1]
-    val = hsv[:, :, 2]
-    valid = disk & ((delta_lab > 5.0) | (sat > 30) | (val > surface_stats["cloth_v"] + 10) | (val < surface_stats["cloth_v"] - 12))
-    if np.count_nonzero(valid) < 0.35 * np.count_nonzero(disk):
-        valid = disk.copy()
-
-    white_mask = valid & (sat < max(55, int(0.45 * surface_stats["cloth_s"]))) & (val > max(145, int(surface_stats["cloth_v"] + 6)))
-    black_mask = valid & (val < min(88, max(45, int(surface_stats["cloth_v"] - 22))))
-    colored_mask = valid & (~white_mask) & (~black_mask) & ((sat > 38) | (delta_lab > 12.0))
-
-    valid_count = max(1, int(np.count_nonzero(valid)))
-    white_ratio = float(np.count_nonzero(white_mask)) / valid_count
-    black_ratio = float(np.count_nonzero(black_mask)) / valid_count
-    colored_ratio = float(np.count_nonzero(colored_mask)) / valid_count
-
-    if black_ratio > 0.42 and colored_ratio < 0.30:
-        color_name = "black"
-        ball_type = "solid"
-        number = 8
-    elif white_ratio > 0.72 and colored_ratio < 0.08:
-        color_name = "white"
-        ball_type = "cue"
-        number = 0
-    else:
-        color_lab = None
-        if np.count_nonzero(colored_mask) > 0:
-            color_lab = np.median(lab[colored_mask], axis=0)
-        elif np.count_nonzero(core) > 0:
-            color_lab = np.median(lab[core], axis=0)
-
-        color_name = _nearest_ball_color_from_lab(color_lab)
-        if color_name is None:
-            return None
-
-        stripe = white_ratio > 0.27 and colored_ratio > 0.05
-        if color_name == "black":
-            ball_type = "solid"
-            number = 8
+def _classify_ball_hsv(img, hsv_img, lab_img, x, y, r, W, H):
+    x1, y1 = max(0, x - r), max(0, y - r)
+    x2, y2 = min(W, x + r + 1), min(H, y + r + 1)
+    roi_hsv = hsv_img[y1:y2, x1:x2]
+    roi_lab = lab_img[y1:y2, x1:x2]
+    yy, xx = np.ogrid[:roi_hsv.shape[0], :roi_hsv.shape[1]]
+    disk = (xx - (x - x1)) ** 2 + (yy - (y - y1)) ** 2 <= (0.85 * r) ** 2
+    sat = roi_hsv[:, :, 1]
+    val = roi_hsv[:, :, 2]
+    hue = roi_hsv[:, :, 0]
+
+    white_m = disk & (sat < 65) & (val > 140)
+    black_m = disk & (val < 80)
+    color_m = disk & (~white_m) & (~black_m) & (sat > 40)
+
+    total = max(1, int(np.count_nonzero(disk)))
+    wr = np.count_nonzero(white_m) / total
+    br = np.count_nonzero(black_m) / total
+    cr = np.count_nonzero(color_m) / total
+
+    if wr > 0.50 and cr < 0.45:
+        color_name, number = "white", 0
+    elif br > 0.45 and cr < 0.20:
+        color_name, number = "black", 8
+    elif np.count_nonzero(color_m) >= 15:
+        med_h = float(np.median(hue[color_m]))
+        med_s = float(np.median(sat[color_m]))
+        med_v = float(np.median(val[color_m]))
+        is_stripe = wr > 0.20
+
+        if med_h < 8 and med_s > 120:
+            color_name = "red"
+        elif 8 <= med_h <= 15:
+            color_name = "maroon" if med_v < 140 else "orange"
+        elif 15 < med_h <= 35:
+            color_name = "yellow" if med_s > 115 else "maroon"
+        elif 60 <= med_h <= 90 and med_s > 70:
+            color_name = "green"
+        elif 95 <= med_h <= 120:
+            color_name = "blue" if med_s > 165 else "purple"
         else:
-            ball_type = "stripe" if stripe else "solid"
-            number = BALL_NUMBER_MAP[color_name][1 if stripe else 0]
+            # Fallback: LAB nearest-neighbor
+            mean_lab = np.mean(roi_lab[color_m], axis=0).astype(np.float32)
+            dists = {n: float(np.linalg.norm(mean_lab - ref)) for n, ref in REFERENCE_LAB_COLORS.items()}
+            color_name = min(dists, key=dists.get)
 
-    bbox = {
-        "x": int(max(0, cx - r)),
-        "y": int(max(0, cy - r)),
-        "width": int(min(W - max(0, cx - r), 2 * r)),
-        "height": int(min(H - max(0, cy - r), 2 * r)),
-    }
+        number = BALL_NUMBER_MAP[color_name][1 if is_stripe else 0]
+    else:
+        return None
 
     return {
         "number": int(number),
-        "type": ball_type,
         "color": color_name,
-        "bbox": bbox,
-        "center": [int(cx), int(cy)],
+        "bbox": {"x": int(x - r), "y": int(y - r), "width": int(2 * r), "height": int(2 * r)},
+        "center": [int(x), int(y)],
         "radius": int(r),
     }
 
 
-def detect_and_classify_balls_original(original_img, cloth_model, keep_internal=False):
-    candidates, surface_stats = detect_ball_candidates_original(original_img, cloth_model)
-    detections = []
-    for det in candidates:
-        classified = classify_ball_candidate_original(original_img, det, surface_stats)
-        if classified is None:
+def _detect_balls_on_original(img, blue_mask):
+    H, W = img.shape[:2]
+
+    filled = np.zeros_like(blue_mask)
+    contours, _ = cv2.findContours(blue_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return []
+    cv2.drawContours(filled, [max(contours, key=cv2.contourArea)], -1, 255, -1)
+
+    ys, xs = np.where(filled > 0)
+    if len(xs) == 0:
+        return []
+    table_w = int(xs.max() - xs.min())
+    min_r = max(10, int(table_w * 0.012))
+    max_r = max(min_r + 5, int(table_w * 0.025))
+
+    lab_img = cv2.cvtColor(img, cv2.COLOR_BGR2LAB).astype(np.float32)
+    cloth_lab = np.median(lab_img[filled > 0], axis=0)
+    delta_lab = np.linalg.norm(lab_img - cloth_lab, axis=2)
+
+    gray_blur = cv2.GaussianBlur(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY), (7, 7), 1.5)
+    all_raw = []
+    for p1, p2, dp in [(50, 12, 1.0), (60, 15, 1.0), (40, 10, 1.1),
+                       (70, 18, 1.0), (50, 10, 1.2), (45, 11, 1.0)]:
+        circles = cv2.HoughCircles(gray_blur, cv2.HOUGH_GRADIENT, dp=dp,
+                                   minDist=int(1.8 * min_r), param1=p1, param2=p2,
+                                   minRadius=min_r, maxRadius=max_r)
+        if circles is not None:
+            for x, y, r in np.round(circles[0]).astype(int):
+                if 0 <= y < H and 0 <= x < W and filled[y, x] > 0:
+                    all_raw.append((int(x), int(y), int(r)))
+
+    scored = []
+    for x, y, r in all_raw:
+        yy, xx = np.ogrid[:H, :W]
+        disk_in = ((xx - x) ** 2 + (yy - y) ** 2 <= (0.8 * r) ** 2) & (filled > 0)
+        if np.count_nonzero(disk_in) < 10:
             continue
-        if keep_internal:
-            classified["_score"] = float(det.get("score", 0.0))
-        detections.append(classified)
+        scored.append((float(np.mean(delta_lab[disk_in])), x, y, r))
 
-    if len(detections) >= 4:
-        median_r = float(np.median([d["radius"] for d in detections]))
-        detections = [d for d in detections if (d["radius"] >= 0.60 * median_r) or (d["number"] in (0, 8))]
+    scored.sort(key=lambda c: -c[0])
+    detected = []
+    for sc, x, y, r in scored:
+        if sc < 30:
+            continue
+        if any((x - px) ** 2 + (y - py) ** 2 < (max(r, pr) * 1.6) ** 2 for _, px, py, pr in detected):
+            continue
+        detected.append((sc, x, y, r))
 
-    final = []
-    for det in sorted(detections, key=lambda d: (-d["bbox"]["width"] * d["bbox"]["height"], d["bbox"]["y"], d["bbox"]["x"])):
-        x, y = det["center"]
-        r = det["radius"]
-        duplicate = False
-        for prev in final:
-            px, py = prev["center"]
-            pr = prev["radius"]
-            if (x - px) ** 2 + (y - py) ** 2 < (1.05 * max(r, pr)) ** 2:
-                duplicate = True
-                break
-        if not duplicate:
-            final.append(det)
+    hsv_img = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+    lab_img2 = cv2.cvtColor(img, cv2.COLOR_BGR2LAB).astype(np.float32)
+    balls = []
+    for sc, x, y, r in detected:
+        classified = _classify_ball_hsv(img, hsv_img, lab_img2, x, y, r, W, H)
+        if classified:
+            balls.append(classified)
 
-    final = sorted(final, key=lambda d: (d["bbox"]["y"], d["bbox"]["x"]))
-    return final
+    return balls
+
+def draw_ball_detections_normalized(img, balls, W, H):
+    out = img.copy()
+    for b in balls:
+        x1 = int(b["xmin"] * W); y1 = int(b["ymin"] * H)
+        x2 = int(b["xmax"] * W); y2 = int(b["ymax"] * H)
+        cv2.rectangle(out, (x1, y1), (x2, y2), (0, 255, 0), 2)
+        cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
+        cv2.putText(out, str(b["number"]), (x1, max(15, y1 - 5)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 4, cv2.LINE_AA)
+        cv2.putText(out, str(b["number"]), (x1, max(15, y1 - 5)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
+    return out
+
+def run_pipeline(image_path, display=False):
+    img = load_image(image_path)
+    H, W = img.shape[:2]
+
+    labels, shape, K = kmeans_cluster_refined(img, 5)
+    masks = get_cluster_masks(labels, shape, K)
+    blue_idx = find_blue_cluster(img, labels, K)
+
+    if blue_idx == -1:
+        return {"image_path": image_path, "num_balls": 0, "balls": [], "top_view": None}
+
+    blue_mask = masks[blue_idx]
+    balls = _detect_balls_on_original(img, blue_mask)
+
+    # Normalise bboxes to [0,1]
+    output_balls = []
+    for b in balls:
+        bx, by, bw, bh = b["bbox"]["x"], b["bbox"]["y"], b["bbox"]["width"], b["bbox"]["height"]
+        output_balls.append({
+            "number": b["number"],
+            "xmin": float(max(0, bx) / W),
+            "xmax": float(min(W, bx + bw) / W),
+            "ymin": float(max(0, by) / H),
+            "ymax": float(min(H, by + bh) / H),
+        })
+
+    # Top-view
+    target = select_target_cluster(img, labels, masks, blue_idx)
+    warped = warp_from_cluster(img, masks[target]) if target != -1 else None
+    top_view = extract_blue_cloth(warped, padding=20) if warped is not None else None
+
+    if display:
+        show("Original", img)
+        if top_view is not None:
+            show("Top View", top_view)
+        print(f"Total balls: {len(output_balls)}")
+        for b in output_balls:
+            print(f"  Ball {b['number']}")
+
+    return {
+        "image_path": image_path,
+        "num_balls": len(output_balls),
+        "balls": output_balls,
+        "top_view": top_view,
+        "img": img,
+    }
+
+def process_images(input_json, output_json, top_view_dir=None, annotated_dir=None, display=False):
+    with open(input_json, "r") as f:
+        data = json.load(f)
+    image_paths = data.get("image_path", [])
+
+    if top_view_dir:
+        os.makedirs(top_view_dir, exist_ok=True)
+    if annotated_dir:
+        os.makedirs(annotated_dir, exist_ok=True)
+
+    results = []
+    for path in image_paths:
+        print(f"Processing {path}...")
+        try:
+            result = run_pipeline(path, display=display)
+        except Exception as e:
+            print(f"  ERROR: {e}")
+            result = {"image_path": path, "num_balls": 0, "balls": [], "top_view": None, "img": None}
+
+        results.append({
+            "image_path": result["image_path"],
+            "num_balls": result["num_balls"],
+            "balls": result["balls"],
+        })
+
+        name = os.path.basename(path)
+
+        if top_view_dir and result.get("top_view") is not None:
+            cv2.imwrite(os.path.join(top_view_dir, name), result["top_view"])
+
+        if annotated_dir and result.get("img") is not None:
+            img = result["img"]
+            H_img, W_img = img.shape[:2]
+            annotated = draw_ball_detections_normalized(img, result["balls"], W_img, H_img)
+            cv2.imwrite(os.path.join(annotated_dir, name), annotated)
+
+    with open(output_json, "w") as f:
+        json.dump(results, f, indent=2)
+
+    print(f"Saved {len(results)} results to {output_json}")
+    return results
+
+if __name__ == "__main__":
+    BASE = r"C:\Users\victo\OneDrive - Universidade do Porto\MIA_1Y2S\VC_2"
+    development_dir = os.path.join(BASE, "development_set")
+
+    process_images(
+        input_json=os.path.join(BASE, "input_test.json"),
+        output_json=os.path.join(BASE, "output.json"),
+        top_view_dir=os.path.join(development_dir, "top_views"),
+        annotated_dir=os.path.join(development_dir, "detections"),
+    )

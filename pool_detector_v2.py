@@ -359,7 +359,7 @@ def process_image(image_path):
 
 
 def main():
-    development_dir = r"C:\Users\mateu\PycharmProjects\ComputerVision_1-Projeto\development_set"
+    development_dir = r"C:\Users\victo\OneDrive - Universidade do Porto\MIA_1Y2S\VC_2\development_set"
     for image in os.listdir(development_dir):
         if image.endswith(".jpg"):
             process_image(os.path.join(development_dir, image))
